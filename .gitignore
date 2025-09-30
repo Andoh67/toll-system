@@ -1,0 +1,7 @@
+"node_modules/" 
+".env" 
+"env.*" 
+".env.json" 
+"serviceAccountKey.json" 
+"*.log" 
+".DS_Store" 
