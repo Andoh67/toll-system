@@ -40,7 +40,15 @@ const IFTTT_KEY = process.env.IFTTT_KEY;
 // -------------------- RFID → Paystack Customer Mapping --------------------
 const rfidToCustomer = JSON.parse(process.env.RFID_MAPPING || '{"7a5a3d02":"CUS_nqf4gq1bbkwf2kx","937db7e4":"CUS_v4k17y3gstgxpbt","14973ca3":"CUS_wzphr3hmdh2is1q"}');
 
+// -------------------- Vehicle Email Mapping --------------------
+const rfidToEmail = {
+  "7a5a3d02": process.env.VEHICLE_7A5A3D02_EMAIL || "baffoestephen980@gmail.com",
+  "937db7e4": process.env.VEHICLE_937DB7E4_EMAIL || "billionsblay233257@gmail.com",
+  "14973ca3": process.env.VEHICLE_14973CA3_EMAIL || "mentorgabriel000@gmail.com",
+};
+
 console.log("🔑 Loaded RFID Mapping:", Object.keys(rfidToCustomer));
+console.log("📧 Loaded Email Mapping:", rfidToEmail);
 
 // -------------------- IFTTT Webhook Helper --------------------
 function sendIFTTTWebhook(eventName, value1, value2, value3, value4) {
@@ -76,7 +84,6 @@ async function createPaymentLink(rfid, customerId, amount) {
           timestamp: new Date().toISOString()
         },
         channels: ["card", "mobile_money"],
-        // Add these fields to ensure proper link generation
         line_items: [
           {
             name: ` Toll Top-up for ${rfid} `,
@@ -170,6 +177,21 @@ app.post("/esp32/topup", async (req, res) => {
     console.log("✅ Payment link created successfully");
     console.log("🔗 Final Payment Link:", result.link);
     
+    // Update vehicle email in Firebase if missing
+    const vehicleEmail = rfidToEmail[normalizedRfid];
+    if (vehicleEmail) {
+      try {
+        const vehicleRef = db.ref(` vehicles/${normalizedRfid} `);
+        const snapshot = await vehicleRef.once("value");
+        if (snapshot.exists() && !snapshot.val().email) {
+          await vehicleRef.update({ email: vehicleEmail });
+          console.log("✅ Email updated in Firebase:", vehicleEmail);
+        }
+      } catch (error) {
+        console.error("❌ Failed to update email in Firebase:", error);
+      }
+    }
+    
     // Send IFTTT notification
     sendIFTTTWebhook(
       "topup_requested",
@@ -219,9 +241,6 @@ app.post("/paystack/webhook", async (req, res) => {
     console.log("📥 Event Type:", event.event);
     console.log("📋 Webhook Data:", JSON.stringify(event.data, null, 2));
 
-    // Verify this is from Paystack (optional but recommended)
-    // You should verify the signature in production
-
     if (event.event === "charge.success") {
       const metadata = event.data.metadata;
       const rfid = metadata?.rfid;
@@ -240,22 +259,18 @@ app.post("/paystack/webhook", async (req, res) => {
       if (!rfid) {
         console.error("❌ No RFID found in Paystack metadata");
         console.log("📋 Available metadata:", metadata);
-        // Try to find RFID from customer email
-        if (customerEmail) {
-          console.log("🔍 Attempting to find RFID by customer email...");
-          // You could implement a reverse lookup here if needed
-        }
         return res.status(400).send("No RFID in metadata");
       }
 
-      const vehicleRef = db.ref(` vehicles/${rfid} `);
+      const normalizedRfid = rfid.toLowerCase();
+      const vehicleRef = db.ref(` vehicles/${normalizedRfid} `);
       const snapshot = await vehicleRef.once("value");
 
       if (!snapshot.exists()) {
-        console.error("❌ No vehicle found with RFID:", rfid);
+        console.error("❌ No vehicle found with RFID:", normalizedRfid);
         sendIFTTTWebhook(
           "unknown_topup",
-          rfid,
+          normalizedRfid,
           ` GH₵${amountPaid} `,
           reference,
           "No vehicle linked to this RFID"
@@ -266,12 +281,18 @@ app.post("/paystack/webhook", async (req, res) => {
       const vehicleData = snapshot.val();
       const currentBalance = vehicleData.balance || 0;
       const currentDebt = vehicleData.debt || 0;
-      const vehicleEmail = vehicleData.email;
+      const vehicleEmail = vehicleData.email || rfidToEmail[normalizedRfid];
 
-      console.log(` 🚗 Vehicle Found: ${rfid} `);
+      console.log(` 🚗 Vehicle Found: ${normalizedRfid} `);
       console.log(` 📧 Vehicle Email: ${vehicleEmail} `);
       console.log(` 💳 Current Balance: GH₵${currentBalance} `);
       console.log(` 📉 Current Debt: GH₵${currentDebt} `);
+
+      // Update vehicle email if missing
+      if (!vehicleData.email && vehicleEmail) {
+        await vehicleRef.update({ email: vehicleEmail });
+        console.log("✅ Email updated for vehicle:", vehicleEmail);
+      }
 
       let remainingAmount = amountPaid;
       let newDebt = currentDebt;
@@ -301,18 +322,27 @@ app.post("/paystack/webhook", async (req, res) => {
 
       try {
         // Update Firebase with both balance and debt
-        await vehicleRef.update({
+        const updates = {
           balance: newBalance,
           debt: newDebt,
-          last_topup: timestamp,
-          last_topup_amount: amountPaid
-        });
+          lastTopup: timestamp,
+          lastTopupAmount: amountPaid
+        };
+
+        // Ensure email is set
+        if (!vehicleData.email && vehicleEmail) {
+          updates.email = vehicleEmail;
+        }
+
+        await vehicleRef.update(updates);
 
         console.log("✅ Firebase updated successfully");
 
         // Log the transaction
-        const historyRef = db.ref(` transactions/${rfid} `).push();
+        const transactionId = Date.now();
+        const historyRef = db.ref(` transactions/${normalizedRfid}/${transactionId} `);
         await historyRef.set({
+          type: "topup",
           amount: amountPaid,
           balance_before: currentBalance,
           balance_after: newBalance,
@@ -322,7 +352,6 @@ app.post("/paystack/webhook", async (req, res) => {
           time: timestamp,
           source: "Paystack Top-up",
           reference: reference,
-          type: "topup",
           status: "completed",
           customer_email: customerEmail
         });
@@ -333,7 +362,7 @@ app.post("/paystack/webhook", async (req, res) => {
         if (currentDebt > 0) {
           sendIFTTTWebhook(
             "debt_cleared",
-            rfid,
+            normalizedRfid,
             ` GH₵${currentDebt - newDebt} `,
             ` GH₵${newBalance} `,
             ` Remaining debt: GH₵${newDebt} | Ref: ${reference} `
@@ -341,7 +370,7 @@ app.post("/paystack/webhook", async (req, res) => {
         } else {
           sendIFTTTWebhook(
             "topup_completed",
-            rfid,
+            normalizedRfid,
             ` GH₵${amountPaid} `,
             ` GH₵${newBalance} `,
             ` Reference: ${reference} `
@@ -354,7 +383,7 @@ app.post("/paystack/webhook", async (req, res) => {
         console.error("❌ Firebase update error:", firebaseError);
         sendIFTTTWebhook(
           "firebase_error",
-          rfid,
+          normalizedRfid,
           ` GH₵${amountPaid} `,
           firebaseError.message,
           "Failed to update Firebase after payment"
@@ -404,7 +433,8 @@ app.post("/manual/update-balance", async (req, res) => {
   }
 
   try {
-    const vehicleRef = db.ref(` vehicles/${rfid} `);
+    const normalizedRfid = rfid.toLowerCase();
+    const vehicleRef = db.ref(` vehicles/${normalizedRfid} `);
     const updates = {};
     
     if (balance !== undefined) updates.balance = parseFloat(balance) || 0;
@@ -416,7 +446,8 @@ app.post("/manual/update-balance", async (req, res) => {
     console.log("✅ Manual update successful");
     
     // Log the manual update
-    const historyRef = db.ref(` transactions/${rfid} `).push();
+    const transactionId = Date.now();
+    const historyRef = db.ref(` transactions/${normalizedRfid}/${transactionId} `);
     await historyRef.set({
       type: "manual_update",
       balance: parseFloat(balance) || 0,
@@ -428,7 +459,7 @@ app.post("/manual/update-balance", async (req, res) => {
     res.json({ 
       status: "success", 
       message: "Balance updated successfully",
-      rfid: rfid,
+      rfid: normalizedRfid,
       balance: parseFloat(balance) || 0,
       debt: parseFloat(debt) || 0
     });
@@ -444,9 +475,10 @@ app.post("/manual/update-balance", async (req, res) => {
 // -------------------- Get Vehicle Info Endpoint --------------------
 app.get("/vehicle/:rfid", async (req, res) => {
   const { rfid } = req.params;
+  const normalizedRfid = rfid.toLowerCase();
   
   try {
-    const snapshot = await db.ref(` vehicles/${rfid} `).once("value");
+    const snapshot = await db.ref(` vehicles/${normalizedRfid} `).once("value");
     if (!snapshot.exists()) {
       return res.status(404).json({ error: "Vehicle not found" });
     }
@@ -457,6 +489,51 @@ app.get("/vehicle/:rfid", async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// -------------------- Initialize Vehicle Endpoint --------------------
+app.post("/vehicle/initialize", async (req, res) => {
+  const { rfid, email, vehicleType = "car", ownerName } = req.body;
+  
+  if (!rfid) {
+    return res.status(400).json({ error: "RFID is required" });
+  }
+
+  const normalizedRfid = rfid.toLowerCase();
+  
+  try {
+    const vehicleRef = db.ref(` vehicles/${normalizedRfid} `);
+    const initialData = {
+      balance: 0,
+      debt: 0,
+      lastTopup: null,
+      lastTopupAmount: 0,
+      lastDeduction: null,
+      email: email || rfidToEmail[normalizedRfid] || "",
+      vehicleType: vehicleType,
+      ownerName: ownerName || ` Vehicle ${normalizedRfid} `,
+      createdAt: new Date().toISOString()
+    };
+
+    await vehicleRef.set(initialData);
+
+    // Initialize empty transactions node
+    await db.ref(` transactions/${normalizedRfid} `).set({});
+
+    console.log("✅ Vehicle initialized:", normalizedRfid);
+    
+    res.json({
+      status: "success",
+      message: "Vehicle initialized successfully",
+      vehicle: initialData
+    });
+  } catch (error) {
+    console.error("❌ Vehicle initialization failed:", error);
+    res.status(500).json({ 
+      status: "error", 
+      error: error.message 
+    });
   }
 });
 
@@ -471,10 +548,12 @@ app.get("/test", (req, res) => {
       webhook: "POST /paystack/webhook", 
       manual_update: "POST /manual/update-balance",
       vehicle_info: "GET /vehicle/:rfid",
+      initialize_vehicle: "POST /vehicle/initialize",
       test_vehicles: "GET /test/vehicles",
       health: "GET /health"
     },
-    rfid_mapping: Object.keys(rfidToCustomer)
+    rfid_mapping: Object.keys(rfidToCustomer),
+    email_mapping: rfidToEmail
   });
 });
 
@@ -522,6 +601,7 @@ app.use((req, res) => {
       "POST /paystack/webhook",
       "POST /manual/update-balance", 
       "GET /vehicle/:rfid",
+      "POST /vehicle/initialize",
       "GET /test",
       "GET /test/vehicles",
       "GET /health"
@@ -538,13 +618,15 @@ app.listen(PORT, () => {
   console.log(` 📍 Port: ${PORT} `);
   console.log(` 🌍 Environment: ${process.env.NODE_ENV || 'production'} `);
   console.log(` 🔑 RFID Tags Configured: ${Object.keys(rfidToCustomer).length} `);
-  console.log(` 💳 Paystack: ${PAYSTACK_SECRET_KEY ? ' ✅ Configured' : '❌ Not configured'} `);
+  console.log(` 📧 Email Mapping: ${Object.keys(rfidToEmail).length} vehicles `);
+  console.log(` 💳 Paystack: ${PAYSTACK_SECRET_KEY ? '✅ Configured' : '❌ Not configured'} `);
   console.log(` 🔔 IFTTT: ${IFTTT_KEY ? '✅ Configured' : '❌ Not configured'} `);
   console.log(` 🔥 Firebase: ✅ Connected `);
   console.log("\n📋 Available Endpoints:");
   console.log(`   💳 POST /esp32/topup     - Request top-up payment link`);
   console.log(`   📡 POST /paystack/webhook - Process payment notifications`);
   console.log(`   🔧 POST /manual/update-balance - Manual balance updates`);
+  console.log(`   🚗 POST /vehicle/initialize - Initialize new vehicle`);
   console.log(`   ℹ  GET /vehicle/:rfid    - Get vehicle information`);
   console.log(`   🧪 GET /test             - Test server status`);
   console.log(`   🧪 GET /test/vehicles    - List all vehicles`);
