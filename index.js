@@ -27,7 +27,6 @@ admin.initializeApp({
 });
 const db = admin.database();
 
-
 // -------------------- Environment Variables --------------------
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const IFTTT_KEY = process.env.IFTTT_KEY;
@@ -60,7 +59,8 @@ async function createPaymentLink(rfid, customerId, amount) {
         metadata: {
           rfid: rfid,
           purpose: "toll_topup"
-        }
+        },
+        channels: ["card", "mobile_money"]
       },
       {
         headers: {
@@ -112,6 +112,7 @@ app.post("/esp32/topup", async (req, res) => {
   if (result.status === "success") {
     console.log("✅ Payment link created:", result.link);
     
+    // Send IFTTT notification
     sendIFTTTWebhook(
       "topup_requested",
       normalizedRfid,
@@ -136,126 +137,182 @@ app.post("/esp32/topup", async (req, res) => {
   }
 });
 
-// -------------------- Webhook for Paystack (Debt Clearing) --------------------
+// -------------------- Webhook for Paystack (Payment Processing) --------------------
 app.post("/paystack/webhook", async (req, res) => {
   console.log("\n========== 📡 Incoming Webhook from Paystack ==========");
   
   try {
     const event = req.body;
     console.log("📥 Event:", event.event);
+    console.log("📋 Event data:", JSON.stringify(event.data, null, 2));
 
     if (event.event === "charge.success") {
-      const email = event.data.customer.email;
+      const metadata = event.data.metadata;
+      const rfid = metadata?.rfid;
       const amountPaid = event.data.amount / 100;
       const timestamp = new Date().toISOString();
       const reference = event.data.reference;
 
+      if (!rfid) {
+        console.error("❌ No RFID found in Paystack metadata");
+        return res.status(400).send("No RFID in metadata");
+      }
+
       console.log("💰 Payment Successful!");
-      console.log(`👤 Customer Email: ${email}`);
+      console.log(`🔑 RFID: ${rfid}`);
       console.log(`💵 Amount Paid: GH₵${amountPaid}`);
       console.log(`🔢 Reference: ${reference}`);
       console.log(`⏰ Time: ${timestamp}`);
 
-      const vehiclesRef = db.ref("vehicles");
-      const snapshot = await vehiclesRef.once("value");
-      let vehicleFound = false;
+      const vehicleRef = db.ref(`vehicles/${rfid}`);
+      const snapshot = await vehicleRef.once("value");
 
-      snapshot.forEach(async (child) => {
-        if (child.val().email === email) {
-          vehicleFound = true;
-          const vehicleId = child.key;
-          const currentBalance = child.val().balance || 0;
-          const currentDebt = child.val().debt || 0;
-
-          console.log(`🚗 Vehicle Found: ${vehicleId}`);
-          console.log(`💳 Current Balance: GH₵${currentBalance}`);
-          console.log(`📉 Current Debt: GH₵${currentDebt}`);
-
-          let remainingAmount = amountPaid;
-          let newDebt = currentDebt;
-          let newBalance = currentBalance;
-
-          if (currentDebt > 0) {
-            if (remainingAmount >= currentDebt) {
-              remainingAmount -= currentDebt;
-              newDebt = 0;
-              console.log(`✅ Debt cleared: GH₵${currentDebt}`);
-            } else {
-              newDebt = currentDebt - remainingAmount;
-              remainingAmount = 0;
-              console.log(`✅ Partial debt cleared: GH₵${currentDebt - newDebt}, Remaining debt: GH₵${newDebt}`);
-            }
-          }
-
-          if (remainingAmount > 0) {
-            newBalance = currentBalance + remainingAmount;
-            console.log(`💰 Added to balance: GH₵${remainingAmount}`);
-          }
-
-          console.log(`💳 New Balance: GH₵${newBalance}`);
-          console.log(`📉 New Debt: GH₵${newDebt}`);
-
-          try {
-            await db.ref(`vehicles/${vehicleId}/balance`).set(newBalance);
-            await db.ref(`vehicles/${vehicleId}/debt`).set(newDebt);
-
-            const historyRef = db.ref(`transactions/${vehicleId}`).push();
-            await historyRef.set({
-              amount: amountPaid,
-              balance_after: newBalance,
-              debt_after: newDebt,
-              debt_cleared: currentDebt - newDebt,
-              time: timestamp,
-              source: "Paystack Top-up",
-              reference: reference,
-              type: "topup"
-            });
-
-            console.log("✅ Firebase updated successfully");
-
-            if (currentDebt > 0) {
-              sendIFTTTWebhook(
-                "debt_cleared",
-                vehicleId,
-                `GH₵${currentDebt - newDebt}`,
-                `GH₵${newBalance}`,
-                `Remaining debt: GH₵${newDebt}`
-              );
-            } else {
-              sendIFTTTWebhook(
-                "topup_completed",
-                vehicleId,
-                `GH₵${amountPaid}`,
-                `GH₵${newBalance}`,
-                reference
-              );
-            }
-
-          } catch (firebaseError) {
-            console.error("❌ Firebase update error:", firebaseError);
-          }
-        }
-      });
-
-      if (!vehicleFound) {
-        console.error("❌ No vehicle found with email:", email);
+      if (!snapshot.exists()) {
+        console.error("❌ No vehicle found with RFID:", rfid);
         sendIFTTTWebhook(
           "unknown_topup",
-          email,
+          rfid,
           `GH₵${amountPaid}`,
           reference,
-          "No vehicle linked to this email"
+          "No vehicle linked to this RFID"
+        );
+        return res.status(404).send("Vehicle not found");
+      }
+
+      const vehicleData = snapshot.val();
+      const currentBalance = vehicleData.balance || 0;
+      const currentDebt = vehicleData.debt || 0;
+
+      console.log(`🚗 Vehicle Found: ${rfid}`);
+      console.log(`💳 Current Balance: GH₵${currentBalance}`);
+      console.log(`📉 Current Debt: GH₵${currentDebt}`);
+
+      let remainingAmount = amountPaid;
+      let newDebt = currentDebt;
+      let newBalance = currentBalance;
+
+      // Clear debt first
+      if (currentDebt > 0) {
+        if (remainingAmount >= currentDebt) {
+          remainingAmount -= currentDebt;
+          newDebt = 0;
+          console.log(`✅ Debt cleared: GH₵${currentDebt}`);
+        } else {
+          newDebt = currentDebt - remainingAmount;
+          remainingAmount = 0;
+          console.log(`✅ Partial debt cleared: GH₵${currentDebt - newDebt}`);
+        }
+      }
+
+      // Add remaining to balance
+      if (remainingAmount > 0) {
+        newBalance = currentBalance + remainingAmount;
+        console.log(`💰 Added to balance: GH₵${remainingAmount}`);
+      }
+
+      console.log(`💳 New Balance: GH₵${newBalance}`);
+      console.log(`📉 New Debt: GH₵${newDebt}`);
+
+      try {
+        // Update Firebase with both balance and debt
+        await vehicleRef.update({
+          balance: newBalance,
+          debt: newDebt
+        });
+
+        // Log the transaction
+        const historyRef = db.ref(`transactions/${rfid}`).push();
+        await historyRef.set({
+          amount: amountPaid,
+          balance_before: currentBalance,
+          balance_after: newBalance,
+          debt_before: currentDebt,
+          debt_after: newDebt,
+          debt_cleared: currentDebt - newDebt,
+          time: timestamp,
+          source: "Paystack Top-up",
+          reference: reference,
+          type: "topup",
+          status: "completed"
+        });
+
+        console.log("✅ Firebase updated successfully");
+
+        // Send appropriate notification
+        if (currentDebt > 0) {
+          sendIFTTTWebhook(
+            "debt_cleared",
+            rfid,
+            `GH₵${currentDebt - newDebt}`,
+            `GH₵${newBalance}`,
+            `Remaining debt: GH₵${newDebt}`
+          );
+        } else {
+          sendIFTTTWebhook(
+            "topup_completed",
+            rfid,
+            `GH₵${amountPaid}`,
+            `GH₵${newBalance}`,
+            reference
+          );
+        }
+
+        console.log("✅ Webhook processed successfully");
+
+      } catch (firebaseError) {
+        console.error("❌ Firebase update error:", firebaseError);
+        sendIFTTTWebhook(
+          "firebase_error",
+          rfid,
+          `GH₵${amountPaid}`,
+          firebaseError.message,
+          "Failed to update Firebase"
+        );
+      }
+    } else if (event.event === "charge.failed") {
+      console.log("❌ Payment failed:", event.data);
+      const rfid = event.data.metadata?.rfid;
+      if (rfid) {
+        sendIFTTTWebhook(
+          "payment_failed",
+          rfid,
+          `GH₵${event.data.amount / 100}`,
+          event.data.gateway_response || "Payment failed",
+          event.data.reference
         );
       }
     }
 
     res.sendStatus(200);
-    console.log("✅ Webhook processed successfully.");
     console.log("=======================================================");
     
   } catch (err) {
     console.error("❌ Webhook processing error:", err);
     res.sendStatus(500);
+  }
+});
+
+// -------------------- Manual Balance Update Endpoint --------------------
+app.post("/manual/update-balance", async (req, res) => {
+  const { rfid, balance, debt } = req.body;
+
+  console.log("\n========== 🔧 Manual Balance Update ==========");
+  console.log(`📌 RFID: ${rfid}`);
+  console.log(`💵 Balance: GH₵${balance}`);
+  console.log(`📉 Debt: GH₵${debt}`);
+
+  try {
+    const vehicleRef = db.ref(`vehicles/${rfid}`);
+    await vehicleRef.update({
+      balance: parseFloat(balance) || 0,
+      debt: parseFloat(debt) || 0
+    });
+
+    console.log("✅ Manual update successful");
+    res.json({ status: "success", message: "Balance updated successfully" });
+  } catch (error) {
+    console.error("❌ Manual update failed:", error);
+    res.status(500).json({ status: "error", error: error.message });
   }
 });
 
@@ -266,7 +323,9 @@ app.get("/test", (req, res) => {
     timestamp: new Date().toISOString(),
     endpoints: {
       topup: "/esp32/topup",
-      webhook: "/paystack/webhook"
+      webhook: "/paystack/webhook",
+      manual_update: "/manual/update-balance",
+      vehicles: "/test/vehicles"
     }
   });
 });
@@ -280,11 +339,44 @@ app.get("/test/vehicles", async (req, res) => {
   }
 });
 
+// -------------------- Health Check --------------------
+app.get("/health", (req, res) => {
+  res.json({ 
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    service: "Automated Toll System API"
+  });
+});
+
+// -------------------- Error Handling --------------------
+app.use((err, req, res, next) => {
+  console.error("❌ Server error:", err);
+  res.status(500).json({ 
+    status: "error", 
+    message: "Internal server error",
+    error: err.message 
+  });
+});
+
+// -------------------- 404 Handler --------------------
+app.use((req, res) => {
+  res.status(404).json({ 
+    status: "error", 
+    message: "Endpoint not found" 
+  });
+});
+
 // -------------------- Start Express Server --------------------
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log("===============================================");
   console.log(`🚀 Node.js Server running on port ${PORT}`);
-  console.log(`📌 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`📌 Environment: ${process.env.NODE_ENV || 'production'}`);
+  console.log(`💳 Top-up Endpoint: /esp32/topup`);
+  console.log(`🔔 Webhook Endpoint: /paystack/webhook`);
+  console.log(`🧪 Test: /test`);
+  console.log(`❤ Health: /health`);
   console.log("===============================================");
 });
+
+export default app;
