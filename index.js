@@ -223,10 +223,10 @@ app.post("/esp32/topup", async (req, res) => {
       }
     }
     
-    // Send notification using existing toll_debt_memberX applets
-    let eventName = "toll_debt_member1";
-    if (normalizedRfid === "937db7e4") eventName = "toll_debt_member2";
-    else if (normalizedRfid === "14973ca3") eventName = "toll_debt_member3";
+    // Send notification using existing Toll_debt_memberX applets
+    let eventName = "Toll_debt_member1";
+    if (normalizedRfid === "937db7e4") eventName = "Toll_debt_member2";
+    else if (normalizedRfid === "14973ca3") eventName = "Toll_debt_member3";
     
     sendIFTTTWebhook(
       eventName,
@@ -247,10 +247,10 @@ app.post("/esp32/topup", async (req, res) => {
   } else {
     console.error("❌ Failed to create payment link:", result.error);
     
-    // Send failure notification using existing toll_debt_memberX applets
-    let eventName = "toll_debt_member1";
-    if (normalizedRfid === "937db7e4") eventName = "toll_debt_member2";
-    else if (normalizedRfid === "14973ca3") eventName = "toll_debt_member3";
+    // Send failure notification using existing Toll_debt_memberX applets
+    let eventName = "Toll_debt_member1";
+    if (normalizedRfid === "937db7e4") eventName = "Toll_debt_member2";
+    else if (normalizedRfid === "14973ca3") eventName = "Toll_debt_member3";
     
     sendIFTTTWebhook(
       eventName,
@@ -398,10 +398,10 @@ app.post("/paystack/webhook", async (req, res) => {
 
         console.log("✅ Transaction logged successfully");
 
-        // Send notification using existing toll_paid_memberX applets
-        let eventName = "toll_paid_member1";
-        if (normalizedRfid === "937db7e4") eventName = "toll_paid_member2";
-        else if (normalizedRfid === "14973ca3") eventName = "toll_paid_member3";
+        // Send notification using existing Toll_paid_memberX applets
+        let eventName = "Toll_paid_member1";
+        if (normalizedRfid === "937db7e4") eventName = "Toll_paid_member2";
+        else if (normalizedRfid === "14973ca3") eventName = "Toll_paid_member3";
         
         if (currentDebt > 0) {
           sendIFTTTWebhook(
@@ -447,9 +447,9 @@ app.post("/paystack/webhook", async (req, res) => {
       const rfid = event.data.metadata?.rfid;
       if (rfid) {
         const normalizedRfid = rfid.toLowerCase().trim();
-        let eventName = "toll_debt_member1";
-        if (normalizedRfid === "937db7e4") eventName = "toll_debt_member2";
-        else if (normalizedRfid === "14973ca3") eventName = "toll_debt_member3";
+        let eventName = "Toll_debt_member1";
+        if (normalizedRfid === "937db7e4") eventName = "Toll_debt_member2";
+        else if (normalizedRfid === "14973ca3") eventName = "Toll_debt_member3";
         
         sendIFTTTWebhook(
           eventName,
