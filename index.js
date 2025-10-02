@@ -188,7 +188,7 @@ app.post("/esp32/topup", async (req, res) => {
     });
   }
 
-  const normalizedRfid = rfid.toLowerCase();
+  const normalizedRfid = rfid.toLowerCase().trim();
   console.log(`🔍 Looking up RFID: ${normalizedRfid}`);
   
   if (!rfidToCustomer[normalizedRfid]) {
@@ -297,7 +297,7 @@ app.post("/paystack/webhook", async (req, res) => {
         return res.status(400).send("No RFID in metadata");
       }
 
-      const normalizedRfid = rfid.toLowerCase();
+      const normalizedRfid = rfid.toLowerCase().trim();
       const vehicleRef = db.ref(`vehicles/${normalizedRfid}`);
       const snapshot = await vehicleRef.once("value");
 
@@ -451,7 +451,7 @@ app.post("/paystack/webhook", async (req, res) => {
   console.log("=".repeat(50));
 });
 
-// -------------------- Manual Balance Update Endpoint --------------------
+// -------------------- IMPROVED Manual Balance Update Endpoint --------------------
 app.post("/manual/update-balance", async (req, res) => {
   console.log("\n" + "=".repeat(50));
   console.log("🔧 MANUAL BALANCE UPDATE");
@@ -468,17 +468,43 @@ app.post("/manual/update-balance", async (req, res) => {
   }
 
   try {
-    const normalizedRfid = rfid.toLowerCase();
+    const normalizedRfid = rfid.toLowerCase().trim();
     const vehicleRef = db.ref(`vehicles/${normalizedRfid}`);
-    const updates = {};
+    const snapshot = await vehicleRef.once("value");
+    
+    let updates = {};
     
     if (balance !== undefined) updates.balance = parseFloat(balance) || 0;
     if (debt !== undefined) updates.debt = parseFloat(debt) || 0;
-    updates.last_manual_update = new Date().toISOString();
+    
+    // Preserve existing data if available
+    if (snapshot.exists()) {
+      const existingData = snapshot.val();
+      updates = {
+        ...existingData,
+        ...updates,
+        last_manual_update: new Date().toISOString()
+      };
+    } else {
+      // Create complete vehicle record if it doesn't exist
+      updates = {
+        balance: parseFloat(balance) || 0,
+        debt: parseFloat(debt) || 0,
+        lastTopup: null,
+        lastTopupAmount: 0,
+        lastDeduction: null,
+        email: rfidToEmail[normalizedRfid] || "",
+        vehicleType: "car",
+        ownerName: `Vehicle ${normalizedRfid}`,
+        createdAt: new Date().toISOString(),
+        last_manual_update: new Date().toISOString()
+      };
+    }
 
-    await vehicleRef.update(updates);
+    await vehicleRef.set(updates);
 
     console.log("✅ Manual update successful");
+    console.log("📊 Updated vehicle data:", JSON.stringify(updates, null, 2));
     
     // Log the manual update
     const transactionId = Date.now();
@@ -495,8 +521,7 @@ app.post("/manual/update-balance", async (req, res) => {
       status: "success", 
       message: "Balance updated successfully",
       rfid: normalizedRfid,
-      balance: parseFloat(balance) || 0,
-      debt: parseFloat(debt) || 0
+      vehicle: updates
     });
   } catch (error) {
     console.error("❌ Manual update failed:", error);
@@ -507,10 +532,68 @@ app.post("/manual/update-balance", async (req, res) => {
   }
 });
 
+// -------------------- Cleanup Duplicate Entries --------------------
+app.post("/cleanup/firebase", async (req, res) => {
+  console.log("\n" + "=".repeat(50));
+  console.log("🧹 CLEANING UP FIREBASE DUPLICATES");
+  console.log("=".repeat(50));
+  
+  try {
+    // Remove duplicate entries with spaces
+    await db.ref(" vehicles").remove();
+    await db.ref(" transactions").remove();
+    
+    console.log("✅ Removed duplicate entries with spaces");
+    
+    // Ensure all vehicles have complete data
+    const vehicles = ["7a5a3d02", "937db7e4", "14973ca3"];
+    
+    for (const rfid of vehicles) {
+      const vehicleRef = db.ref(`vehicles/${rfid}`);
+      const snapshot = await vehicleRef.once("value");
+      
+      if (snapshot.exists()) {
+        const vehicleData = snapshot.val();
+        const updates = {};
+        
+        // Ensure all required fields exist
+        if (!vehicleData.balance) updates.balance = 0;
+        if (!vehicleData.debt) updates.debt = 0;
+        if (!vehicleData.lastTopup) updates.lastTopup = null;
+        if (!vehicleData.lastTopupAmount) updates.lastTopupAmount = 0;
+        if (!vehicleData.lastDeduction) updates.lastDeduction = null;
+        if (!vehicleData.vehicleType) updates.vehicleType = "car";
+        if (!vehicleData.createdAt) updates.createdAt = new Date().toISOString();
+        
+        if (Object.keys(updates).length > 0) {
+          await vehicleRef.update(updates);
+          console.log(`✅ Updated vehicle ${rfid} with missing fields`);
+        }
+      }
+    }
+    
+    console.log("✅ Firebase cleanup completed successfully");
+    
+    res.json({
+      status: "success",
+      message: "Firebase cleanup completed",
+      cleaned_entries: [" vehicles", " transactions"],
+      updated_vehicles: vehicles
+    });
+    
+  } catch (error) {
+    console.error("❌ Cleanup failed:", error);
+    res.status(500).json({
+      status: "error",
+      error: error.message
+    });
+  }
+});
+
 // -------------------- Get Vehicle Info Endpoint --------------------
 app.get("/vehicle/:rfid", async (req, res) => {
   const { rfid } = req.params;
-  const normalizedRfid = rfid.toLowerCase();
+  const normalizedRfid = rfid.toLowerCase().trim();
   
   try {
     const snapshot = await db.ref(`vehicles/${normalizedRfid}`).once("value");
@@ -535,7 +618,7 @@ app.post("/vehicle/initialize", async (req, res) => {
     return res.status(400).json({ error: "RFID is required" });
   }
 
-  const normalizedRfid = rfid.toLowerCase();
+  const normalizedRfid = rfid.toLowerCase().trim();
   
   try {
     const vehicleRef = db.ref(`vehicles/${normalizedRfid}`);
@@ -582,6 +665,7 @@ app.get("/test", (req, res) => {
       topup: "POST /esp32/topup",
       webhook: "POST /paystack/webhook", 
       manual_update: "POST /manual/update-balance",
+      cleanup: "POST /cleanup/firebase",
       vehicle_info: "GET /vehicle/:rfid",
       initialize_vehicle: "POST /vehicle/initialize",
       test_vehicles: "GET /test/vehicles",
@@ -610,7 +694,7 @@ app.get("/health", (req, res) => {
     status: "healthy",
     timestamp: new Date().toISOString(),
     service: "Automated Toll System API",
-    version: "2.0",
+    version: "2.1",
     firebase: "connected",
     paystack: PAYSTACK_SECRET_KEY ? "configured" : "not configured"
   });
@@ -635,6 +719,7 @@ app.use((req, res) => {
       "POST /esp32/topup",
       "POST /paystack/webhook",
       "POST /manual/update-balance", 
+      "POST /cleanup/firebase",
       "GET /vehicle/:rfid",
       "POST /vehicle/initialize",
       "GET /test",
@@ -661,6 +746,7 @@ app.listen(PORT, () => {
   console.log(`   💳 POST /esp32/topup     - Request top-up payment link`);
   console.log(`   📡 POST /paystack/webhook - Process payment notifications`);
   console.log(`   🔧 POST /manual/update-balance - Manual balance updates`);
+  console.log(`   🧹 POST /cleanup/firebase - Clean up duplicate entries`);
   console.log(`   🚗 POST /vehicle/initialize - Initialize new vehicle`);
   console.log(`   ℹ  GET /vehicle/:rfid    - Get vehicle information`);
   console.log(`   🧪 GET /test             - Test server status`);
