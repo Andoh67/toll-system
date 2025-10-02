@@ -61,36 +61,32 @@ function sendIFTTTWebhook(eventName, value1, value2, value3, value4) {
   axios.get(url).catch(err => console.error("IFTTT error:", err.message));
 }
 
-// Paystack Top-up Link Generator
+// -------------------- ALTERNATIVE: Use Transaction API --------------------
 async function createPaymentLink(rfid, customerId, amount) {
   try {
-    console.log(`🔗 Creating payment link for RFID: ${rfid}, Customer: ${customerId}, Amount: ₵${amount / 100}`);
+    console.log(`🔗 Creating transaction for RFID: ${rfid}, Customer: ${customerId}, Amount: ₵${amount / 100}`);
     
     if (!PAYSTACK_SECRET_KEY) {
       console.error("❌ Paystack secret key not configured");
       return { status: "error", error: "Paystack secret key not configured" };
     }
 
+    // Use transaction API instead of payment request
     const response = await axios.post(
-      "https://api.paystack.co/paymentrequest",
+      "https://api.paystack.co/transaction/initialize",
       {
-        customer: customerId,
+        email: rfidToEmail[rfid] || "baffoestephen980@gmail.com",
         amount: amount,
         currency: "GHS",
-        description: `Toll system top-up for RFID ${rfid}`,
+        reference: `toll_${rfid}_${Date.now()}`,
+        callback_url: "https://toll-system-o71i.onrender.com/paystack/webhook",
         metadata: {
           rfid: rfid,
+          customer_id: customerId,
           purpose: "toll_topup",
           timestamp: new Date().toISOString()
         },
-        channels: ["card", "mobile_money"],
-        line_items: [
-          {
-            name: `Toll Top-up for ${rfid}`,
-            amount: amount,
-            quantity: 1
-          }
-        ]
+        channels: ["card", "mobile_money"]
       },
       {
         headers: {
@@ -101,52 +97,37 @@ async function createPaymentLink(rfid, customerId, amount) {
       }
     );
 
-    console.log("📡 Paystack API Response Status:", response.status);
-    console.log("📡 Paystack API Response Data Status:", response.data?.status);
+    console.log("📡 Paystack Transaction API Response Status:", response.status);
+    console.log("📡 Paystack Transaction API Response Data:", JSON.stringify(response.data, null, 2));
 
     if (response.status === 200 && response.data && response.data.status === true) {
       const paymentData = response.data.data;
-      console.log("✅ Payment request created successfully");
+      console.log("✅ Transaction initialized successfully");
       
-      let paymentLink = "";
-      
-      if (paymentData.link) {
-        paymentLink = paymentData.link;
-        console.log("🔗 Using 'link' field:", paymentLink);
-      } else if (paymentData.hosted_link) {
-        paymentLink = paymentData.hosted_link;
-        console.log("🔗 Using 'hosted_link' field:", paymentLink);
-      } else if (paymentData.checkout_url) {
-        paymentLink = paymentData.checkout_url;
-        console.log("🔗 Using 'checkout_url' field:", paymentLink);
-      } else if (paymentData.authorization_url) {
-        paymentLink = paymentData.authorization_url;
-        console.log("🔗 Using 'authorization_url' field:", paymentLink);
+      if (paymentData.authorization_url) {
+        console.log("🔗 Authorization URL:", paymentData.authorization_url);
+        
+        return {
+          status: "success",
+          amount: amount,
+          link: paymentData.authorization_url,
+          reference: paymentData.reference,
+          message: "Payment link generated successfully"
+        };
       } else {
-        console.log("❌ No payment link found in Paystack response");
-        console.log("💡 Available fields:", Object.keys(paymentData));
+        console.error("❌ No authorization URL in response");
         return { 
           status: "failed", 
-          error: "No payment link found in Paystack response",
-          details: "Available fields: " + Object.keys(paymentData).join(", ")
+          error: "No payment authorization URL received from Paystack",
+          details: paymentData
         };
       }
-      
-      console.log("📋 Reference:", paymentData.reference);
-      
-      return {
-        status: "success",
-        amount: amount,
-        link: paymentLink,
-        reference: paymentData.reference,
-        message: "Payment link generated successfully"
-      };
     } else {
-      console.error("❌ Paystack API returned error:");
+      console.error("❌ Paystack Transaction API returned error:");
       console.error("Response Status:", response.status);
       console.error("Response Data:", response.data);
       
-      const errorMessage = response.data?.message || "Paystack API error";
+      const errorMessage = response.data?.message || "Paystack Transaction API error";
       return { 
         status: "failed", 
         error: errorMessage,
@@ -154,7 +135,7 @@ async function createPaymentLink(rfid, customerId, amount) {
       };
     }
   } catch (err) {
-    console.error("❌ Paystack request error:");
+    console.error("❌ Paystack transaction request error:");
     console.error("Error Message:", err.message);
     
     if (err.response) {
