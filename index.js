@@ -50,32 +50,123 @@ const rfidToEmail = {
 console.log("🔑 Loaded RFID Mapping:", Object.keys(rfidToCustomer));
 console.log("📧 Loaded Email Mapping:", rfidToEmail);
 
-// IFTTT Webhook Helper - USING EXISTING APPLETS
+// IFTTT Webhook Helper
 function sendIFTTTWebhook(eventName, value1, value2, value3, value4) {
   if (!IFTTT_KEY) {
     console.log("IFTTT key not configured");
     return;
   }
   const url = `http://maker.ifttt.com/trigger/${eventName}/with/key/${IFTTT_KEY}?value1=${value1}&value2=${value2}&value3=${value3}&value4=${value4}`;
-  console.log(`🔔 Sending IFTTT: ${eventName}`, { value1, value2, value3, value4 });
+  console.log(`🔔 Sending IFTTT: ${eventName} `, { value1, value2, value3, value4 });
   axios.get(url).catch(err => console.error("IFTTT error:", err.message));
 }
 
-// -------------------- ALTERNATIVE: Use Transaction API --------------------
+// ===================== AUTOMATIC DEBT DEDUCTION =====================
+async function processPendingDebt(rfid, paymentAmount) {
+  try {
+    console.log(`🔍 Checking for pending debt for RFID: ${rfid}`);
+    
+    const vehicleRef = db.ref(`vehicles/${rfid}`);
+    const snapshot = await vehicleRef.once("value");
+    
+    if (!snapshot.exists()) {
+      console.log("❌ No vehicle found for debt processing");
+      return { processed: false, reason: "Vehicle not found" };
+    }
+    
+    const vehicleData = snapshot.val();
+    const currentDebt = vehicleData.debt || 0;
+    const currentBalance = vehicleData.balance || 0;
+    
+    console.log(`📊 Debt Check - Balance: GH₵${currentBalance}, Debt: GH₵${currentDebt}`);
+    
+    if (currentDebt > 0) {
+      console.log(`💰 Processing automatic debt deduction: GH₵${currentDebt}`);
+      
+      // Calculate how much debt we can clear
+      const amountAvailable = currentBalance + paymentAmount;
+      const debtToClear = Math.min(currentDebt, amountAvailable);
+      const remainingDebt = currentDebt - debtToClear;
+      const newBalance = amountAvailable - debtToClear;
+      
+      console.log(`🧮 Debt Calculation:`);
+      console.log(`   Available: GH₵${amountAvailable}`);
+      console.log(`   Debt to clear: GH₵${debtToClear}`);
+      console.log(` Remaining debt: GH₵${remainingDebt} `);
+      console.log(`   New balance: GH₵${newBalance} `);
+      
+      // Update vehicle data
+      const updates = {
+        balance: newBalance,
+        debt: remainingDebt,
+        lastDebtDeduction: new Date().toISOString(),
+        lastAutoDeduction: new Date().toISOString()
+      };
+      
+      await vehicleRef.update(updates);
+      
+      // Log the automatic debt deduction
+      const transactionId = Date.now();
+      const historyRef = db.ref(`transactions/${rfid}/${transactionId}`);
+      await historyRef.set({
+        type: "auto_debt_deduction",
+        payment_amount: paymentAmount,
+        debt_cleared: debtToClear,
+        debt_remaining: remainingDebt,
+        balance_before: currentBalance,
+        balance_after: newBalance,
+        debt_before: currentDebt,
+        debt_after: remainingDebt,
+        time: new Date().toISOString(),
+        status: "completed",
+        source: "automatic",
+        note: "Automatic debt deduction after top-up"
+      });
+      
+      console.log("✅ Automatic debt deduction completed successfully");
+      
+      // Send notification
+      sendIFTTTWebhook(
+        "toll_log",
+        rfid,
+        `AUTO-DEBT - Cleared: GH₵${debtToClear}`,
+        `Remaining: GH₵${remainingDebt} | Balance: GH₵${newBalance}`,
+        "Automatic debt deduction"
+      );
+      
+      return {
+        processed: true,
+        debtCleared: debtToClear,
+        remainingDebt: remainingDebt,
+        newBalance: newBalance
+      };
+    } else {
+      console.log("✅ No pending debt to process");
+      return { processed: false, reason: "No debt" };
+    }
+  } catch (error) {
+    console.error("❌ Error processing automatic debt:", error);
+    return { processed: false, reason: error.message };
+  }
+}
+
+// ===================== PAYSTACK TRANSACTION API =====================
 async function createPaymentLink(rfid, customerId, amount) {
   try {
-    console.log(`🔗 Creating transaction for RFID: ${rfid}, Customer: ${customerId}, Amount: ₵${amount / 100}`);
+    console.log(`🔗 Creating transaction for RFID: ${rfid}, Customer: ${customerId}, Amount: GH₵${amount / 100}`);
     
     if (!PAYSTACK_SECRET_KEY) {
       console.error("❌ Paystack secret key not configured");
       return { status: "error", error: "Paystack secret key not configured" };
     }
 
-    // Use transaction API instead of payment request
+    const customerEmail = rfidToEmail[rfid] || "baffoestephen980@gmail.com";
+    
+    // Use transaction API for better reliability
     const response = await axios.post(
       "https://api.paystack.co/transaction/initialize",
       {
-        email: rfidToEmail[rfid] || "baffoestephen980@gmail.com",
+        email: customerEmail,
         amount: amount,
         currency: "GHS",
         reference: `toll_${rfid}_${Date.now()}`,
@@ -84,9 +175,10 @@ async function createPaymentLink(rfid, customerId, amount) {
           rfid: rfid,
           customer_id: customerId,
           purpose: "toll_topup",
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
+          vehicle_email: customerEmail
         },
-        channels: ["card", "mobile_money"]
+        channels: ["card", "mobile_money", "bank"]
       },
       {
         headers: {
@@ -98,8 +190,7 @@ async function createPaymentLink(rfid, customerId, amount) {
     );
 
     console.log("📡 Paystack Transaction API Response Status:", response.status);
-    console.log("📡 Paystack Transaction API Response Data:", JSON.stringify(response.data, null, 2));
-
+    
     if (response.status === 200 && response.data && response.data.status === true) {
       const paymentData = response.data.data;
       console.log("✅ Transaction initialized successfully");
@@ -163,7 +254,7 @@ async function createPaymentLink(rfid, customerId, amount) {
   }
 }
 
-// ESP32 Endpoint: Request Top-up
+// ===================== ESP32 TOP-UP ENDPOINT =====================
 app.post("/esp32/topup", async (req, res) => {
   console.log("\n" + "=".repeat(50));
   console.log("💳 TOP-UP REQUEST FROM ESP32");
@@ -172,7 +263,7 @@ app.post("/esp32/topup", async (req, res) => {
   const { rfid, amount } = req.body;
 
   console.log(`📌 RFID: ${rfid}`);
-  console.log(`💵 Amount: ₵${amount / 100}`);
+  console.log(`💵 Amount: GH₵${amount / 100}`);
   console.log(`🔢 Amount in pesewas: ${amount}`);
 
   if (!rfid || !amount) {
@@ -191,8 +282,8 @@ app.post("/esp32/topup", async (req, res) => {
     console.log("📋 Available RFIDs:", Object.keys(rfidToCustomer));
     return res.status(400).json({ 
       status: "failed", 
-      error: `Unknown RFID: ${rfid}. Please register this tag. 
-   ` });
+      error: `Unknown RFID: ${rfid}. Please register this tag.` 
+    });
   }
 
   const customerId = rfidToCustomer[normalizedRfid];
@@ -223,18 +314,33 @@ app.post("/esp32/topup", async (req, res) => {
       }
     }
     
-    // Send notification using existing Toll_debt_memberX applets
-    let eventName = "Toll_debt_member1";
-    if (normalizedRfid === "937db7e4") eventName = "Toll_debt_member2";
-    else if (normalizedRfid === "14973ca3") eventName = "Toll_debt_member3";
+    // The ESP32 will now handle the Top_up_memberX notifications
+    // We'll just log the debt notification here
     
-    sendIFTTTWebhook(
-      eventName,
-      normalizedRfid,
-      `₵${amount / 100}`,
-      result.link,
-      "Payment link generated successfully"
-    );
+    // Get current vehicle data for debt notification
+    try {
+      const vehicleRef = db.ref(`vehicles/${normalizedRfid}`);
+      const snapshot = await vehicleRef.once("value");
+      if (snapshot.exists()) {
+        const vehicleData = snapshot.val();
+        const currentDebt = vehicleData.debt || 0;
+        
+        // Send debt notification (information only - no payment link)
+        let debtEventName = "Toll_debt_member1";
+        if (normalizedRfid === "937db7e4") debtEventName = "Toll_debt_member2";
+        else if (normalizedRfid === "14973ca3") debtEventName = "Toll_debt_member3";
+        
+        sendIFTTTWebhook(
+          debtEventName,
+          normalizedRfid,
+          `Top-up required: GH₵${amount / 100}`,
+          `Current debt: GH₵${currentDebt}`,
+          "Payment link sent separately"
+        );
+      }
+    } catch (error) {
+      console.error("❌ Failed to send debt notification:", error);
+    }
     
     // Return success response
     res.json({
@@ -247,19 +353,6 @@ app.post("/esp32/topup", async (req, res) => {
   } else {
     console.error("❌ Failed to create payment link:", result.error);
     
-    // Send failure notification using existing Toll_debt_memberX applets
-    let eventName = "Toll_debt_member1";
-    if (normalizedRfid === "937db7e4") eventName = "Toll_debt_member2";
-    else if (normalizedRfid === "14973ca3") eventName = "Toll_debt_member3";
-    
-    sendIFTTTWebhook(
-      eventName,
-      normalizedRfid,
-      `₵${amount / 100}`,
-      result.error || "Unknown Paystack error",
-      "Failed to generate payment link"
-    );
-    
     // Return error response
     res.status(500).json({
       status: "failed",
@@ -271,7 +364,7 @@ app.post("/esp32/topup", async (req, res) => {
   console.log("=".repeat(50));
 });
 
-// Paystack Webhook for Payment Processing
+// ===================== PAYSTACK WEBHOOK =====================
 app.post("/paystack/webhook", async (req, res) => {
   console.log("\n" + "=".repeat(50));
   console.log("📡 INCOMING PAYSTACK WEBHOOK");
@@ -303,6 +396,13 @@ app.post("/paystack/webhook", async (req, res) => {
       }
 
       const normalizedRfid = rfid.toLowerCase().trim();
+      
+      // STEP 1: Process any pending debt automatically FIRST
+      console.log("🔄 STEP 1: Processing automatic debt deduction...");
+      const debtResult = await processPendingDebt(normalizedRfid, amountPaid);
+      
+      // STEP 2: Process the normal top-up with remaining amount
+      console.log("🔄 STEP 2: Processing top-up balance...");
       const vehicleRef = db.ref(`vehicles/${normalizedRfid}`);
       const snapshot = await vehicleRef.once("value");
 
@@ -319,8 +419,10 @@ app.post("/paystack/webhook", async (req, res) => {
       }
 
       const vehicleData = snapshot.val();
-      const currentBalance = vehicleData.balance || 0;
-      const currentDebt = vehicleData.debt || 0;
+      
+      // Use values from debt processing if available, otherwise use current values
+      let currentBalance = debtResult.processed ? debtResult.newBalance : (vehicleData.balance || 0);
+      let currentDebt = debtResult.processed ? debtResult.remainingDebt : (vehicleData.debt || 0);
       const vehicleEmail = vehicleData.email || rfidToEmail[normalizedRfid];
 
       console.log(`🚗 Vehicle Found: ${normalizedRfid}`);
@@ -338,8 +440,8 @@ app.post("/paystack/webhook", async (req, res) => {
       let newDebt = currentDebt;
       let newBalance = currentBalance;
 
-      // Clear debt first
-      if (currentDebt > 0) {
+      // If debt wasn't processed in step 1, clear debt now
+      if (!debtResult.processed && currentDebt > 0) {
         if (remainingAmount >= currentDebt) {
           remainingAmount -= currentDebt;
           newDebt = 0;
@@ -378,6 +480,12 @@ app.post("/paystack/webhook", async (req, res) => {
 
         console.log("✅ Firebase updated successfully");
 
+        // Force immediate sync by updating a sync field
+        await new Promise(resolve => setTimeout(resolve, 500));
+        await vehicleRef.update({ lastSync: new Date().toISOString() });
+
+        console.log("✅ Firebase sync forced");
+
         // Log the transaction
         const transactionId = Date.now();
         const historyRef = db.ref(`transactions/${normalizedRfid}/${transactionId}`);
@@ -393,23 +501,26 @@ app.post("/paystack/webhook", async (req, res) => {
           source: "Paystack Top-up",
           reference: reference,
           status: "completed",
-          customer_email: customerEmail
+          customer_email: customerEmail,
+          auto_debt_processed: debtResult.processed,
+          debt_cleared_auto: debtResult.processed ? debtResult.debtCleared : 0
         });
 
         console.log("✅ Transaction logged successfully");
 
-        // Send notification using existing Toll_paid_memberX applets
+        // Send success notification using existing Toll_paid_memberX applets
         let eventName = "Toll_paid_member1";
         if (normalizedRfid === "937db7e4") eventName = "Toll_paid_member2";
         else if (normalizedRfid === "14973ca3") eventName = "Toll_paid_member3";
         
         if (currentDebt > 0) {
+          const debtCleared = currentDebt - newDebt;
           sendIFTTTWebhook(
             eventName,
             normalizedRfid,
-            `Debt cleared: GH₵${currentDebt - newDebt}`,
-            `New Balance: GH₵${newBalance}`,
-            `Remaining debt: GH₵${newDebt} | Ref: ${reference}`
+            `Top-up: GH₵${amountPaid} | Debt cleared: GH₵${debtCleared}`,
+            `New Balance: GH₵${newBalance} | Remaining debt: GH₵${newDebt}`,
+            `Reference: ${reference}`
           );
         } else {
           sendIFTTTWebhook(
@@ -425,7 +536,7 @@ app.post("/paystack/webhook", async (req, res) => {
         sendIFTTTWebhook(
           "toll_log",
           normalizedRfid,
-          `TOPUP - GH₵${amountPaid}`,
+          `TOPUP_SUCCESS - GH₵${amountPaid}`,
           `Balance: GH₵${newBalance} | Debt: GH₵${newDebt}`,
           reference
         );
@@ -447,14 +558,11 @@ app.post("/paystack/webhook", async (req, res) => {
       const rfid = event.data.metadata?.rfid;
       if (rfid) {
         const normalizedRfid = rfid.toLowerCase().trim();
-        let eventName = "Toll_debt_member1";
-        if (normalizedRfid === "937db7e4") eventName = "Toll_debt_member2";
-        else if (normalizedRfid === "14973ca3") eventName = "Toll_debt_member3";
         
         sendIFTTTWebhook(
-          eventName,
-          rfid,
-          `GH₵${event.data.amount / 100}`,
+          "toll_log",
+          normalizedRfid,
+          `PAYMENT_FAILED - GH₵${event.data.amount / 100}`,
           event.data.gateway_response || "Payment failed",
           event.data.reference
         );
@@ -474,7 +582,7 @@ app.post("/paystack/webhook", async (req, res) => {
   console.log("=".repeat(50));
 });
 
-// Manual Balance Update Endpoint
+// ===================== MANUAL BALANCE UPDATE =====================
 app.post("/manual/update-balance", async (req, res) => {
   console.log("\n" + "=".repeat(50));
   console.log("🔧 MANUAL BALANCE UPDATE");
@@ -483,8 +591,8 @@ app.post("/manual/update-balance", async (req, res) => {
   const { rfid, balance, debt } = req.body;
 
   console.log(`📌 RFID: ${rfid}`);
-  console.log(`💵 Balance: GH₵${balance}`);
-  console.log(`📉 Debt: GH₵${debt}`);
+  console.log(`💵 Balance: GH₵${balance});
+  console.log(📉 Debt: GH₵${debt}`);
 
   if (!rfid) {
     return res.status(400).json({ error: "RFID is required" });
@@ -552,7 +660,7 @@ app.post("/manual/update-balance", async (req, res) => {
   }
 });
 
-// Get Vehicle Info Endpoint
+// ===================== VEHICLE INFO ENDPOINT =====================
 app.get("/vehicle/:rfid", async (req, res) => {
   const { rfid } = req.params;
   const normalizedRfid = rfid.toLowerCase().trim();
@@ -572,7 +680,7 @@ app.get("/vehicle/:rfid", async (req, res) => {
   }
 });
 
-// Initialize Vehicle Endpoint
+// ===================== INITIALIZE VEHICLE =====================
 app.post("/vehicle/initialize", async (req, res) => {
   const { rfid, email, vehicleType = "car", ownerName } = req.body;
   
@@ -597,7 +705,6 @@ app.post("/vehicle/initialize", async (req, res) => {
     };
 
     await vehicleRef.set(initialData);
-    await db.ref(`transactions/${normalizedRfid}`).set({});
 
     console.log("✅ Vehicle initialized:", normalizedRfid);
     
@@ -615,100 +722,64 @@ app.post("/vehicle/initialize", async (req, res) => {
   }
 });
 
-// Test Endpoints
-app.get("/test", (req, res) => {
-  res.json({ 
-    status: "✅ Server is running!", 
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'production',
-    endpoints: {
-      topup: "POST /esp32/topup",
-      webhook: "POST /paystack/webhook", 
-      manual_update: "POST /manual/update-balance",
-      vehicle_info: "GET /vehicle/:rfid",
-      initialize_vehicle: "POST /vehicle/initialize",
-      test_vehicles: "GET /test/vehicles",
-      health: "GET /health"
-    },
-    rfid_mapping: Object.keys(rfidToCustomer),
-    email_mapping: rfidToEmail
-  });
-});
-
-app.get("/test/vehicles", async (req, res) => {
+// ===================== SYSTEM STATUS ENDPOINT =====================
+app.get("/system/status", async (req, res) => {
   try {
-    const snapshot = await db.ref("vehicles").once("value");
-    const vehicles = snapshot.val();
-    console.log("📊 Vehicles in database:", Object.keys(vehicles || {}));
-    res.json(vehicles || {});
+    const snapshot = await db.ref("system_status").once("value");
+    const status = snapshot.val() || "System status not available";
+    
+    res.json({
+      status: "success",
+      system_status: status,
+      timestamp: new Date().toISOString()
+    });
   } catch (error) {
-    console.error("❌ Error fetching vehicles:", error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Health Check
+// ===================== HEALTH CHECK =====================
 app.get("/health", (req, res) => {
-  res.json({ 
+  res.json({
     status: "healthy",
     timestamp: new Date().toISOString(),
-    service: "Automated Toll System API",
-    version: "2.1",
-    firebase: "connected",
-    paystack: PAYSTACK_SECRET_KEY ? "configured" : "not configured"
+    service: "Toll System API",
+    version: "2.0.0"
   });
 });
 
-// Error Handling
+// ===================== ERROR HANDLING =====================
 app.use((err, req, res, next) => {
-  console.error("❌ Server error:", err);
-  res.status(500).json({ 
-    status: "error", 
-    message: "Internal server error",
-    error: err.message 
+  console.error("❌ Unhandled error:", err);
+  res.status(500).json({
+    status: "error",
+    error: "Internal server error",
+    message: err.message
   });
 });
 
 // 404 Handler
 app.use((req, res) => {
-  res.status(404).json({ 
-    status: "error", 
-    message: "Endpoint not found",
-    available_endpoints: [
-      "POST /esp32/topup",
-      "POST /paystack/webhook",
-      "POST /manual/update-balance", 
-      "GET /vehicle/:rfid",
-      "POST /vehicle/initialize",
-      "GET /test",
-      "GET /test/vehicles",
-      "GET /health"
-    ]
+  res.status(404).json({
+    status: "error",
+    error: "Endpoint not found"
   });
 });
 
-// Start Express Server
-const PORT = process.env.PORT || 10000;
+// ===================== SERVER STARTUP =====================
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("\n" + "=".repeat(50));
-  console.log("🚀 AUTOMATED TOLL SYSTEM SERVER STARTED");
+  console.log(`🚀 Toll System Server running on port ${PORT}`);
   console.log("=".repeat(50));
-  console.log(`📍 Port: ${PORT}`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'production'}`);
-  console.log(`🔑 RFID Tags Configured: ${Object.keys(rfidToCustomer).length}`);
-  console.log(`📧 Email Mapping: ${Object.keys(rfidToEmail).length} vehicles`);
-  console.log(`💳 Paystack: ${PAYSTACK_SECRET_KEY ? '✅ Configured' : '❌ Not configured'}`);
-  console.log(`🔔 IFTTT: ${IFTTT_KEY ? '✅ Configured' : '❌ Not configured'}`);
-  console.log(`🔥 Firebase: ✅ Connected`);
-  console.log("\n📋 Available Endpoints:");
-  console.log(`   💳 POST /esp32/topup     - Request top-up payment link`);
-  console.log(`   📡 POST /paystack/webhook - Process payment notifications`);
-  console.log(`   🔧 POST /manual/update-balance - Manual balance updates`);
-  console.log(`   🚗 POST /vehicle/initialize - Initialize new vehicle`);
-  console.log(`   ℹ  GET /vehicle/:rfid    - Get vehicle information`);
-  console.log(`   🧪 GET /test             - Test server status`);
-  console.log(`   🧪 GET /test/vehicles    - List all vehicles`);
-  console.log(`   ❤  GET /health          - Health check`);
+  console.log("📋 Available Endpoints:");
+  console.log("   POST /esp32/topup          - ESP32 top-up requests");
+  console.log("   POST /paystack/webhook     - Paystack payment webhook");
+  console.log("   POST /manual/update-balance - Manual balance updates");
+  console.log("   GET  /vehicle/:rfid        - Get vehicle info");
+  console.log("   POST /vehicle/initialize   - Initialize new vehicle");
+  console.log("   GET  /system/status        - System status");
+  console.log("   GET  /health               - Health check");
   console.log("=".repeat(50));
 });
 
